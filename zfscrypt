@@ -1,0 +1,386 @@
+#!/bin/sh
+#
+# Written by Maxim Khitrov (September 2017)
+#
+
+test "$(id -u)" -eq 0 || exec sudo \
+	--preserve-env=KEYSTORE,KEYFILE,KSPART,KSSIZE,KSMNT,ZFSPART,ZFSSIZE \
+	-- "$0" "$@"
+umask 0027
+
+# Location of the keystore file.
+readonly KEYSTORE=${KEYSTORE:-/var/db/zfscrypt.keystore}
+
+# Optional keyfile used to encrypt the keystore.
+readonly KEYFILE
+
+# GPT type of the keystore backup partition. The keystore is copied to this
+# partition after successful disk attachment. This ensures that each disk always
+# has an encrypted copy of all current keyfiles.
+readonly KSPART=${KSPART:-\!bac470e9-1a7b-4cd2-a4a4-f6cc50ca3d81}
+
+# Keystore size in MB (1 MB = 510 keyfiles and geli metadata backups).
+readonly KSSIZE=${KSSIZE:-1}
+
+# Keystore mount directory template for mktemp(1).
+readonly KSMNT=${KSMNT:-/tmp/.zfscrypt.XXXXXXXX}
+
+# GPT type of the encrypted ZFS partition. A custom partition type is used to
+# avoid confusing boot code and rc.d scripts by a freebsd-zfs partition that
+# does not actually contain a valid file system.
+readonly ZFSPART=${ZFSPART:-\!2f56384e-3b56-40d5-ab40-14a2eb1fa433}
+
+# ZFS partition size in MB. This is the usable size of the geli provider. It
+# should be specified when mixing disks of different capacities. By default, the
+# size is set to the maximum 64 MB increment.
+readonly ZFSSIZE
+
+err() { echo error: "$@" >&2; }
+die() { err "$@"; exit 1; }
+
+_help_() {
+	cat <<- END
+	usage: $0 command [args]
+
+	Multi-disk encryption management tool for ZFS.
+
+	Until native ZFS encryption is implemented in FreeBSD, disks must be
+	encrypted using geli(8). This script provides commands for managing multiple
+	encrypted disks as one unit (i.e. without requiring multiple passphrases).
+
+	Disks are encrypted using keyfiles, which are kept in an encrypted keystore.
+	The keystore is a small file-backed memory disk containing a UFS2 file
+	system. To attach ZFS disks, the user enters their passphrase for the
+	keystore, which then provides access to the keyfiles. A backup copy of the
+	keystore is maintained in a dedicated partition on each member disk.
+
+	Devices are specified by their /dev nodes, geom names, or serial numbers
+	(e.g. /dev/ada0, ada0, or ABC123DEF). Use 'geom disk list' to get disk
+	serial numbers (aka idents).
+
+	Commands:
+	    newks [<iterations>]
+	        Create new keystore. Will prompt for the passphrase three times.
+	        If <iterations> is given, it is passed to the geli init -i option.
+
+	    openks
+	        Open keystore. Prints mount point to stdout. This is a debugging
+	        command that should not be used under normal circumstances.
+
+	    closeks
+	        Close keystore after opening it with openks.
+
+	    init <dev> [...]
+	        Partition and encrypt the specified disk(s). Each disk should be
+	        overwritten with random data before using this command (see wipe).
+	        Alternatively, use dd to copy /dev/zero to the encrypted partition
+	        after attaching it. The disk ident (serial number) is used for
+	        partition labels and keyfile name.
+
+	    attach [<dev> ...]
+	        Attach one or more encrypted disks as an all-or-nothing operation.
+	        Failure to attach one of the disks causes all prior disks to be
+	        detached. By default, all enabled disks are attached.
+
+	    detach [<dev> ...]
+	        Detach one or more encrypted disks. By default, all attached disks
+	        are detached.
+
+	    disable <id> [...]
+	        Disable automatic attachment of the specified disk(s), where <id> is
+	        disk ident. This should be done when a disk is removed from the
+	        system to prevent the default attach command from failing.
+
+	    enable <id> [...]
+	        Enable automatic attachment of the specified disk(s) (default).
+
+	    wipe <dev> [<mb>]
+	        Overwrite disk with random data. Uses AES-128-CTR with a random key
+	        as a faster alternative to /dev/random (assuming AES-NI support). If
+	        <mb> is specified, write <mb> MB of random data to the start and end
+	        of the device (useful for destroying GPT structures).
+
+	Example:
+	    zfscrypt newks
+	    zfscrypt init ada0 ada1 ada2
+	    zfscrypt attach
+	    zpool create tank raidz /dev/gpt/*.eli
+
+	END
+	test "$CMD" = "help" && exit 0
+	exit 2
+}
+
+_newks_() {
+	test -e $KEYSTORE && die "$KEYSTORE already exists"
+	test -c /dev/tty && echo "Creating $KEYSTORE..." >/dev/tty
+
+	ddzero of=$KEYSTORE bs=1M count=$KSSIZE || exit
+	defer_close_keystore
+	MD=$(mdconfig -f $KEYSTORE) || exit
+
+	# Authentication not used due to PR 222077. It would be nice to have just to
+	# verify keystore integrity, but not really required to protect keyfiles.
+	geli init -B none ${1:+-i "$1"} ${KEYFILE:+-K "$KEYFILE"} -v $MD || exit
+	geli attach ${KEYFILE:+-k "$KEYFILE"} $MD || exit
+
+	ddzero of=/dev/$MD.eli count=$((KSSIZE*2048-1)) || exit
+	newfs -nf 512 /dev/$MD.eli || exit
+	close_keystore
+}
+
+_openks_()  {
+	open_keystore rw && echo $MNT && trap - EXIT
+}
+
+_closeks_() {
+	MD=$(mdconfig -lf $KEYSTORE | tr -d ' ')
+	MNT=$(mount -p | awk -v dev=/dev/$MD.eli '$1==dev {print $2; exit}')
+	close_keystore
+}
+
+_init_() {
+	test $# -gt 0 || _help_
+	open_keystore rw
+	local dev
+	for dev in $*; do
+		init $dev || exit
+	done
+	close_keystore
+}
+
+_attach_() {
+	local ids id part
+	ids=$(idents $*) || exit
+	open_keystore
+	if [ $# -eq 0 ]; then
+		ids=$(basename -as .key $MNT/*.key)
+		test "$ids" != '*' || ids=
+	fi
+	for id in $ids; do
+		part=/dev/gpt/$id
+		if [ ! -c $part -o ! -c $part.keystore ]; then
+			err "$part{,.keystore} not found"
+			exit 1
+		elif [ ! -f $MNT/$id.key ]; then
+			err "missing keyfile for $part"
+			exit 1
+		fi
+	done
+	for id in $ids; do
+		part=/dev/gpt/$id
+		test -c $part.eli -o \( $# -eq 0 -a -e $MNT/$id.noauto \) && continue
+
+		echo "Attaching $part.eli"
+		geli attach -k $MNT/$id.key -p $part || exit
+		DETACH="$DETACH$part.eli "
+
+		if ! sha512 -c $DIGEST $part.keystore >/dev/null; then
+			echo "Copying $KEYSTORE to $part.keystore"
+			dd if=$KEYSTORE of=$part.keystore bs=1M status=none
+		fi
+	done
+	unset DETACH
+	close_keystore
+}
+
+_detach_() {
+	local rc=0 ids id part
+	ids=$(idents $*) || exit
+	if [ $# -eq 0 ]; then
+		ids=$(basename -as .eli /dev/gpt/*.eli)
+		test "$ids" != '*' || ids=
+	fi
+	for id in $ids; do
+		part=/dev/gpt/$id
+		if [ -c $part.eli -a -c $part.keystore ]; then
+			echo "Detaching $part.eli"
+			geli detach $part.eli || rc=$?
+		fi
+	done
+	return $rc
+}
+
+_disable_() { toggleauto touch $*; }
+_enable_()  { toggleauto rm    $*; }
+
+_wipe_() {
+	test $# -ge 1 -a $# -le 2 || _help_
+	local dev=$1 mb=$2 size yesno ctrlt="(press Ctrl-T for progress)"
+	if [ ! -c "$dev" ]; then
+		dev=/dev/$dev
+		test -c "$dev" || die "$1 is not a character device"
+	fi
+	size=$(devsize $dev) || exit
+
+	read -p "Overwrite $dev with random data (Y/[n])? " yesno
+	test "$yesno" = 'Y' || exit
+	if [ ! "$mb" ]; then
+		echo "Writing $size random bytes to $dev $ctrlt"
+		fastrand $size | dd of=$dev bs=1m
+		exit
+	fi
+
+	test "$mb" -gt 0 || exit
+	local n=$((mb * 1048576))
+	echo "Writing $n random bytes to $dev at offset 0 $ctrlt"
+	fastrand $n | dd of=$dev bs=1m || exit
+
+	local seek=$((size / 1048576 - mb))
+	local off=$((seek * 1048576))
+	n=$((size - off))
+	echo "Writing $n random bytes to $dev at offset $off"
+	fastrand $n | dd of=$dev bs=1m seek=$seek
+}
+
+open_keystore() {
+	test -f $KEYSTORE || die "$KEYSTORE not found (see newks command)"
+	mdconfig -lf $KEYSTORE >/dev/null && die "$KEYSTORE already open"
+	test -c /dev/tty && echo "Opening $KEYSTORE..." >/dev/tty
+	DIGEST=$(sha512 -q $KEYSTORE) || exit
+
+	if [ "$1" = 'rw' ]; then
+		chflags noschg $KEYSTORE || exit  # Requires kern.securelevel < 1
+		SCHG=1
+	else
+		local ro=-r
+	fi
+
+	defer_close_keystore
+	MD=$(mdconfig ${ro:+-o readonly} -f $KEYSTORE) || exit
+	chflags schg $KEYSTORE && unset SCHG
+	MNT=$(mktemp -d $KSMNT) || exit
+
+	geli attach ${KEYFILE:+-k "$KEYFILE"} $ro /dev/$MD || exit
+	mount $ro -o sync /dev/$MD.eli $MNT || exit
+
+	chmod 0750 $MNT
+	chflags nodump $MNT
+	geli detach -l /dev/$MD.eli
+}
+
+close_keystore() {
+	local eli=/dev/$MD.eli rc=0 part
+	mount -p | grep -q "^/dev/$MD\.eli" && umount $eli
+	test ! -e $eli || geli detach $eli       || rc=$?
+	test ! "$MD"   || mdconfig -du $MD       || rc=$?
+	test ! "$MNT"  || rmdir $MNT             || rc=$?
+	test ! "$SCHG" || chflags schg $KEYSTORE || rc=$?
+	for part in $DETACH; do
+		# For loop used because geli exits on first error
+		geli detach $part || rc=$?
+	done
+	unset MD MNT SCHG DETACH
+	return $rc
+}
+
+defer_close_keystore() {
+	trap close_keystore EXIT HUP INT QUIT TERM
+}
+
+init() {
+	local dev=$1 id
+	id=$(devident $dev) || return
+	local part=/dev/gpt/$id ks=$MNT/$id
+
+	echo "Initializing $dev as $part"
+	if gpart show $dev >/dev/null 2>&1; then
+		err "$dev is already partitioned"
+		return 1
+	elif [ ! -c "/dev/diskid/DISK-$id" ]; then
+		err "/dev/diskid/DISK-$id not found"
+		return 1
+	elif [ -e $part -o -e $part.keystore ]; then
+		err "$part{,.keystore} already exists"
+		return 1
+	elif [ -e $ks.key -o -e $ks.eli ]; then
+		err "$ks{.key,.eli} already exists"
+		return 1
+	fi
+
+	mkpart $dev $id || return
+	ddrand of=$ks.key count=1 || return
+	chmod 0000 $ks.key
+	chflags schg $ks.key || return
+
+	geli init -B none -K $ks.key -P -s 4096 $part || return
+	geli backup $part $ks.eli || return
+	chmod 0400 $ks.eli
+	chflags schg $ks.eli
+}
+
+mkpart() {
+	local dev=$1 id=$2 part=/dev/gpt/$2 mb=$ZFSSIZE
+	if [ ! "$mb" ]; then
+		mb=$(devsize $dev) || return  # bytes
+		mb=$(((mb/4096 - KSSIZE*256 - 513) / 16384 * 64))
+	fi
+	gpart create -s GPT -fx $dev &&
+		gpart add -t $KSPART -b 1M -s ${KSSIZE}M -l $id.keystore -fx $dev &&
+		gpart add -t $ZFSPART -s $((mb*1024+4))K -l $id -fx $dev &&
+		gpart commit $dev &&
+		test -c $part -a -c $part.keystore &&
+		return
+	gpart undo $dev
+	err "$dev partitioning failed"
+	return 1
+}
+
+idents() {
+	test $# -eq 0 && return
+	local dev
+	for dev in $(basename -as .eli $*); do
+		if [ -c /dev/gpt/$dev -a -c /dev/gpt/$dev.keystore ]; then
+			echo $dev
+		else
+			devident $dev || return
+		fi
+	done
+}
+
+toggleauto() {
+	local cmd=$1 rc=0 id alt
+	shift
+	test $# -gt 0 || _help_
+	open_keystore rw
+	for id in $*; do
+		if [ ! -f $MNT/$id.key ]; then
+			alt=$(devident $id)
+			if [ ! -f $MNT/$alt.key ]; then
+				err "$id is not in the keystore"; rc=1
+				continue
+			fi
+			id=$alt
+		fi
+		$cmd $MNT/$id.noauto || rc=$?
+	done
+	close_keystore || rc=$?
+	return $rc
+}
+
+devsize()  { devinfo $1 mediasize; }
+devident() { devinfo $1 ident; }
+
+devinfo() {
+	geom disk list "${1#/dev/}" | awk -v "info=$2:" -v rc=1 \
+		'tolower($1)==info {if ($2) {print $2; rc=0} exit} END {exit rc}' &&
+		return
+	err "failed to get $2 for $1"
+	return 1
+}
+
+fastrand() {
+	local blk=$(($1 / 131072)) rem=$(($1 % 131072))
+	{
+		ddrand bs=128 count=1 | sha512
+		ddzero bs=128K count=$blk
+		test $rem -eq 0 || ddzero bs=$rem count=1
+	} | openssl enc -aes-128-ctr -pass stdin -nosalt
+}
+
+ddrand() { dd if=/dev/random status=none "$@"; }
+ddzero() { dd if=/dev/zero   status=none "$@"; }
+
+readonly CMD=$1; shift
+type "_${CMD}_" >/dev/null 2>&1 || _help_
+_${CMD}_ "$@"
