@@ -217,20 +217,20 @@ _wipe_() {
 	test "$yesno" = 'Y' || exit
 	if [ ! "$mb" ]; then
 		echo "Writing $size random bytes to $dev $ctrlt"
-		fastrand $size | dd of=$dev bs=1m
+		fastrand $size | dd of=$dev bs=1M
 		exit
 	fi
 
 	test "$mb" -gt 0 || exit
 	local n=$((mb * 1048576))
 	echo "Writing $n random bytes to $dev at offset 0 $ctrlt"
-	fastrand $n | dd of=$dev bs=1m || exit
+	fastrand $n | dd of=$dev bs=1M || exit
 
 	local seek=$((size / 1048576 - mb))
 	local off=$((seek * 1048576))
 	n=$((size - off))
 	echo "Writing $n random bytes to $dev at offset $off"
-	fastrand $n | dd of=$dev bs=1m seek=$seek
+	fastrand $n | dd of=$dev bs=1M seek=$seek
 }
 
 open_keystore() {
